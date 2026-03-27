@@ -5,6 +5,7 @@
 
 """Storage for the learning algorithms."""
 
+from .diffusion_rollout_storage import DiffusionRolloutStorage
 from .rollout_storage import RolloutStorage
 
-__all__ = ["RolloutStorage"]
+__all__ = ["DiffusionRolloutStorage", "RolloutStorage"]
