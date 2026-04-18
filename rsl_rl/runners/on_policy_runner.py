@@ -12,13 +12,14 @@ import torch
 from collections import deque
 
 import rsl_rl
-from rsl_rl.algorithms import PPO, Distillation
+from rsl_rl.algorithms import PPO, Distillation, DistillationAux
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
     EmpiricalNormalization,
     StudentTeacher,
+    StudentTeacherAux,
     StudentTeacherRecurrent,
 )
 from rsl_rl.utils import store_code_state
@@ -40,7 +41,7 @@ class OnPolicyRunner:
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
-        elif self.alg_cfg["class_name"] == "Distillation":
+        elif self.alg_cfg["class_name"] in ("Distillation", "DistillationAux"):
             self.training_type = "distillation"
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
@@ -93,7 +94,7 @@ class OnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(
+        self.alg: PPO | Distillation | DistillationAux = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
@@ -169,6 +170,19 @@ class OnPolicyRunner:
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        vision_input = None
+        vision_gt_targets = None
+        if isinstance(self.alg, DistillationAux):
+            obs_extras = extras.get("observations", {})
+            vision_input = obs_extras.get("vision_input")
+            vision_gt_targets = obs_extras.get("vision_gt_targets", extras.get("vision_gt_targets"))
+            if vision_input is None or vision_gt_targets is None:
+                raise ValueError(
+                    "DistillationAux requires observations['vision_input'] and "
+                    "observations['vision_gt_targets'] (or extras['vision_gt_targets'])."
+                )
+            vision_input = vision_input.to(self.device)
+            vision_gt_targets = vision_gt_targets.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -201,7 +215,10 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    if isinstance(self.alg, DistillationAux):
+                        actions = self.alg.act(obs, privileged_obs, vision_input, vision_gt_targets)
+                    else:
+                        actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -214,6 +231,17 @@ class OnPolicyRunner:
                         )
                     else:
                         privileged_obs = obs
+                    if isinstance(self.alg, DistillationAux):
+                        obs_extras = infos.get("observations", {})
+                        vision_input = obs_extras.get("vision_input")
+                        vision_gt_targets = obs_extras.get("vision_gt_targets", infos.get("vision_gt_targets"))
+                        if vision_input is None or vision_gt_targets is None:
+                            raise ValueError(
+                                "DistillationAux requires infos['observations']['vision_input'] and "
+                                "infos['observations']['vision_gt_targets'] (or infos['vision_gt_targets'])."
+                            )
+                        vision_input = vision_input.to(self.device)
+                        vision_gt_targets = vision_gt_targets.to(self.device)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -458,6 +486,15 @@ class OnPolicyRunner:
         self.eval_mode()  # switch to evaluation mode (dropout for example)
         if device is not None:
             self.alg.policy.to(device)
+        if isinstance(self.alg, DistillationAux):
+            if self.cfg["empirical_normalization"]:
+                if device is not None:
+                    self.obs_normalizer.to(device)
+                return lambda obs, vision_input: self.alg.policy.act_inference(  # noqa: E731
+                    self.obs_normalizer(obs), vision_input
+                )
+            return lambda obs, vision_input: self.alg.policy.act_inference(obs, vision_input)  # noqa: E731
+
         policy = self.alg.policy.act_inference
         if self.cfg["empirical_normalization"]:
             if device is not None:
