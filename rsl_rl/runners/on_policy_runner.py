@@ -347,6 +347,7 @@ class OnPolicyRunner:
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         mean_std = self.alg.policy.action_std.mean()
+        per_dim_std = self.alg.policy.action_std.mean(dim=0)
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # -- Losses
@@ -356,6 +357,9 @@ class OnPolicyRunner:
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        pad_width = len(str(per_dim_std.shape[0] - 1))
+        for i, s in enumerate(per_dim_std):
+            self.writer.add_scalar(f"Policy/noise_std_{i:0{pad_width}d}", s.item(), locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
