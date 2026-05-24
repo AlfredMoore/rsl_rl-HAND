@@ -69,7 +69,16 @@ class Distillation:
         self.num_updates = 0
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
+        self,
+        training_type,
+        num_envs,
+        num_transitions_per_env,
+        student_obs_shape,
+        teacher_obs_shape,
+        actions_shape,
+        # Optional (C, H, W) shape of the vision tensor. None disables vision
+        # storage entirely — keeps backward compatibility with MLP-only callers.
+        vision_shape: tuple[int, ...] | list[int] | None = None,
     ):
         # create rollout storage
         self.storage = RolloutStorage(
@@ -81,15 +90,20 @@ class Distillation:
             actions_shape,
             None,
             self.device,
+            vision_shape=vision_shape,
         )
 
-    def act(self, obs, teacher_obs):
+    def act(self, obs, teacher_obs, vision: torch.Tensor | None = None):
+        """Sample student action from obs (+ optional vision); compute teacher
+        target on privileged obs (teacher never sees vision)."""
         # compute the actions
-        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.actions = self.policy.act(obs, vision=vision).detach()
         self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
+        # record vision (None when not provided)
+        self.transition.vision = vision
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -110,10 +124,11 @@ class Distillation:
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, _, privileged_actions, dones in self.storage.generator():
+            for obs, _, _, privileged_actions, dones, vision in self.storage.generator():
 
                 # inference the student for gradient computation
-                actions = self.policy.act_inference(obs)
+                # (vision=None for MLP-only policies; ignored by act_inference)
+                actions = self.policy.act_inference(obs, vision=vision)
 
                 # behavior cloning loss
                 behavior_loss = self.loss_fn(actions, privileged_actions)

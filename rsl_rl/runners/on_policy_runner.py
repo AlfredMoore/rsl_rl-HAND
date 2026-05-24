@@ -111,7 +111,28 @@ class OnPolicyRunner:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
-        # init storage and model
+        # ── Optional vision input ─────────────────────────────────────────
+        # Vision-aware Distillation reads obs["vision"] from extras at every
+        # step. If the env exposes a "vision" key at startup, capture its
+        # shape (C, H, W) so the rollout storage allocates the right buffer.
+        # Aux-distillation has its own vision_input/vision_gt_targets channel
+        # and is NOT touched here.
+        self._uses_vision = (
+            self.training_type == "distillation"
+            and not isinstance(self.alg, DistillationAux)
+            and extras.get("observations", {}).get("vision") is not None
+        )
+        vision_shape = None
+        if self._uses_vision:
+            init_vision = extras["observations"]["vision"]
+            vision_shape = tuple(init_vision.shape[1:])  # (C, H, W)
+
+        # init storage and model. PPO / DistillationAux don't take the
+        # vision_shape kwarg; only the vision-aware Distillation path does.
+        init_storage_kwargs: dict = {}
+        if self._uses_vision:
+            init_storage_kwargs["vision_shape"] = vision_shape
+
         self.alg.init_storage(
             self.training_type,
             self.env.num_envs,
@@ -119,6 +140,7 @@ class OnPolicyRunner:
             [num_obs],
             [num_privileged_obs],
             [self.env.num_actions],
+            **init_storage_kwargs,
         )
 
         # Decide whether to disable logging
@@ -183,6 +205,17 @@ class OnPolicyRunner:
                 )
             vision_input = vision_input.to(self.device)
             vision_gt_targets = vision_gt_targets.to(self.device)
+        # Vision-aware Distillation (non-aux): read obs["vision"] from extras.
+        # Stays None for PPO / MLP-only Distillation — alg.act ignores None.
+        vision = None
+        if self._uses_vision:
+            vision = extras["observations"].get("vision")
+            if vision is None:
+                raise ValueError(
+                    "Vision-aware Distillation requires observations['vision'] "
+                    "at every step (env exposed it at startup but not now)."
+                )
+            vision = vision.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Book keeping
@@ -217,6 +250,8 @@ class OnPolicyRunner:
                     # Sample actions
                     if isinstance(self.alg, DistillationAux):
                         actions = self.alg.act(obs, privileged_obs, vision_input, vision_gt_targets)
+                    elif self._uses_vision:
+                        actions = self.alg.act(obs, privileged_obs, vision=vision)
                     else:
                         actions = self.alg.act(obs, privileged_obs)
                     # Step the environment
@@ -242,6 +277,15 @@ class OnPolicyRunner:
                             )
                         vision_input = vision_input.to(self.device)
                         vision_gt_targets = vision_gt_targets.to(self.device)
+                    elif self._uses_vision:
+                        # Refresh vision from infos for the next step's act().
+                        vision = infos.get("observations", {}).get("vision")
+                        if vision is None:
+                            raise ValueError(
+                                "Vision-aware Distillation requires infos['observations']['vision'] "
+                                "after every env.step()."
+                            )
+                        vision = vision.to(self.device)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -497,6 +541,20 @@ class OnPolicyRunner:
                     self.obs_normalizer(obs), vision_input
                 )
             return lambda obs, vision_input: self.alg.policy.act_inference(obs, vision_input)  # noqa: E731
+
+        # Vision-aware Distillation (non-aux): returns a 2-arg lambda
+        #     policy(obs, vision) -> action
+        # so callers (play.py / depth_policy_node) can supply the vision
+        # tensor explicitly. MLP-only Distillation / PPO fall through to the
+        # standard 1-arg policy below.
+        if getattr(self, "_uses_vision", False):
+            if self.cfg["empirical_normalization"]:
+                if device is not None:
+                    self.obs_normalizer.to(device)
+                return lambda obs, vision: self.alg.policy.act_inference(  # noqa: E731
+                    self.obs_normalizer(obs), vision=vision
+                )
+            return lambda obs, vision: self.alg.policy.act_inference(obs, vision=vision)  # noqa: E731
 
         policy = self.alg.policy.act_inference
         if self.cfg["empirical_normalization"]:

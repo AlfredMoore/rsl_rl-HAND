@@ -25,6 +25,10 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+            # Optional vision tensor (B, C, H, W). Populated when the algorithm
+            # supports vision (e.g. distillation with a vision-encoder student).
+            # None when the policy is MLP-only — keeps full backward compatibility.
+            self.vision = None
 
         def clear(self):
             self.__init__()
@@ -39,6 +43,9 @@ class RolloutStorage:
         actions_shape,
         rnd_state_shape=None,
         device="cpu",
+        # Optional vision tensor shape (C, H, W). None disables vision storage.
+        # Existing call sites that don't pass this keep behaving identically.
+        vision_shape: tuple[int, ...] | list[int] | None = None,
     ):
         # store inputs
         self.training_type = training_type
@@ -49,6 +56,7 @@ class RolloutStorage:
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
+        self.vision_shape = tuple(vision_shape) if vision_shape is not None else None
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -61,6 +69,17 @@ class RolloutStorage:
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
+
+        # Vision tensor — same device as the rest of the storage to avoid PCIe
+        # transfers during the (potentially large per-step) vision copy. If the
+        # user is short on VRAM at 1024 envs / 240x320 vision, they can move
+        # this single tensor to CPU manually after construction.
+        if self.vision_shape is not None:
+            self.vision = torch.zeros(
+                num_transitions_per_env, num_envs, *self.vision_shape, device=self.device,
+            )
+        else:
+            self.vision = None
 
         # for distillation
         if training_type == "distillation":
@@ -102,6 +121,11 @@ class RolloutStorage:
         # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
+
+        # Optional vision tensor — only copied if both storage was constructed
+        # with vision_shape AND the transition actually carries vision data.
+        if self.vision is not None and transition.vision is not None:
+            self.vision[self.step].copy_(transition.vision)
 
         # for reinforcement learning
         if self.training_type == "rl":
@@ -176,9 +200,16 @@ class RolloutStorage:
                 privileged_observations = self.privileged_observations[i]
             else:
                 privileged_observations = self.observations[i]
-            yield self.observations[i], privileged_observations, self.actions[i], self.privileged_actions[
-                i
-            ], self.dones[i]
+            # vision slice (None when storage wasn't built with vision_shape)
+            vision_i = self.vision[i] if self.vision is not None else None
+            yield (
+                self.observations[i],
+                privileged_observations,
+                self.actions[i],
+                self.privileged_actions[i],
+                self.dones[i],
+                vision_i,
+            )
 
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
